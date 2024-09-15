@@ -1,4 +1,4 @@
-# Rust NDArray with Python Test Suite
+# rtensor
 
 This project implements a simple NDArray structure in Rust with matrix multiplication functionality. It includes a Python test suite that compares the Rust implementation's results with NumPy's results.
 
