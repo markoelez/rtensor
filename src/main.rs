@@ -1,9 +1,12 @@
-use std::{cmp::max, iter::repeat, string};
+use std::cmp::max;
+use std::env;
+use std::iter::repeat;
+use std::process;
 
+#[derive(Debug, Clone)]
 struct NDArray {
     buf: Vec<i32>,
     shape: Vec<usize>,
-    stride: Vec<usize>,
 }
 
 fn compute_stride(shape: &[usize]) -> Vec<usize> {
@@ -29,15 +32,12 @@ fn broadcast(a: &[usize], b: &[usize]) -> Result<Vec<usize>, String> {
     let out_dims = max(a.len(), b.len());
     let mut res = Vec::with_capacity(out_dims);
 
-    for (aa, bb) in a.iter().zip(b.iter()).rev() {
-        if aa == bb {
-            res.push(*aa);
-        } else if *aa == 1 {
-            res.push(*bb)
-        } else if *bb == 1 {
-            res.push(*aa)
-        } else {
-            return Err(format!("Shapes {:?} and {:?} are not broadcastable", a, b));
+    for (aa, bb) in a.iter().rev().zip(b.iter().rev()) {
+        match (*aa, *bb) {
+            (x, y) if x == y => res.push(x),
+            (1, y) => res.push(y),
+            (x, 1) => res.push(x),
+            _ => return Err(format!("Shapes {:?} and {:?} are not broadcastable", a, b)),
         }
     }
 
@@ -66,23 +66,18 @@ impl Iterator for MultiIndexIterator {
     type Item = Vec<usize>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.done {
-            return None;
-        }
-
-        let res = self.curr.as_ref().unwrap().clone();
+        let curr = self.curr.as_mut()?;
+        let res = curr.clone();
 
         for i in (0..self.shape.len()).rev() {
-            if self.curr.as_ref().unwrap()[i] + 1 < self.shape[i] {
-                self.curr.as_mut().unwrap()[i] += 1;
-                for j in i + 1..self.shape.len() {
-                    self.curr.as_mut().unwrap()[j] = 0;
-                }
+            if curr[i] + 1 < self.shape[i] {
+                curr[i] += 1;
+                curr[i + 1..].fill(0);
                 return Some(res);
             }
         }
 
-        self.done = true;
+        self.curr = None;
         Some(res)
     }
 }
@@ -99,57 +94,69 @@ fn broadcast_to(
             shape.len()
         )
     })?;
-    let padded_shape: Vec<usize> = repeat(1).take(ldiff).chain(shape.into_iter()).collect();
 
-    let mut repeat_factors = Vec::new();
-    for (p_dim, t_dim) in padded_shape.iter().zip(target_shape.iter()) {
-        if *p_dim == *t_dim {
-            repeat_factors.push(1);
-        } else if *p_dim == 1 {
-            repeat_factors.push(*t_dim);
-        } else {
-            return Err(format!(
-                "Shapes are not compatible for broadcasting at dimension: {} vs {}",
-                p_dim, t_dim
-            ));
-        }
-    }
+    let padded_shape: Vec<usize> = repeat(1).take(ldiff).chain(shape).collect();
 
-    fn rpt(buf: &[i32], buf_shape: &[usize], repeat_factors: &[usize]) -> Vec<i32> {
-        if buf_shape.is_empty() {
-            return buf.to_vec();
-        }
-
-        let mut res = Vec::new();
-        let repeats = repeat_factors[0];
-        let inner_buf_size = buf_shape[1..].iter().product::<usize>();
-        let mut chunks = buf.chunks(inner_buf_size);
-
-        if buf_shape[0] == 1 {
-            // Only one chunk to repeat
-            let chunk = chunks.next().unwrap();
-            for _ in 0..repeats {
-                res.extend(rpt(chunk, &buf_shape[1..], &repeat_factors[1..]));
+    let repeat_factors: Vec<usize> = padded_shape
+        .iter()
+        .zip(&target_shape)
+        .map(|(&p_dim, &t_dim)| {
+            if p_dim == t_dim {
+                Ok(1)
+            } else if p_dim == 1 {
+                Ok(t_dim)
+            } else {
+                Err(format!(
+                    "Shapes are not compatible for broadcasting at dimension: {} vs {}",
+                    p_dim, t_dim
+                ))
             }
-        } else {
-            // Process each chunk
-            for chunk in chunks {
-                let sub_res = rpt(chunk, &buf_shape[1..], &repeat_factors[1..]);
-                for _ in 0..repeats {
-                    res.extend(sub_res.clone());
-                }
-            }
-        }
+        })
+        .collect::<Result<_, _>>()?;
 
-        res
-    }
-
-    let res = rpt(&buf, &padded_shape, &repeat_factors);
-    Ok(res)
+    Ok(rpt(&buf, &padded_shape, &repeat_factors))
 }
 
-fn bslice(buf: Vec<usize>, shape: Vec<usize>, bidxs: Vec<usize>) {
-    // TODO: slice along batch indices
+fn rpt(buf: &[i32], buf_shape: &[usize], repeat_factors: &[usize]) -> Vec<i32> {
+    if buf_shape.is_empty() {
+        return buf.to_vec();
+    }
+
+    let repeats = repeat_factors[0];
+    let inner_buf_size: usize = buf_shape[1..].iter().product();
+    let mut chunks = buf.chunks(inner_buf_size);
+
+    if buf_shape[0] == 1 {
+        // Only one chunk to repeat
+        chunks
+            .next()
+            .map(|chunk| {
+                (0..repeats)
+                    .flat_map(|_| rpt(chunk, &buf_shape[1..], &repeat_factors[1..]))
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else {
+        // Process each chunk
+        chunks
+            .flat_map(|chunk| {
+                let sub_res = rpt(chunk, &buf_shape[1..], &repeat_factors[1..]);
+                repeat(sub_res).take(repeats).flatten()
+            })
+            .collect()
+    }
+}
+
+fn bslice<'a>(buf: &'a [i32], shape: &[usize], bidxs: &[usize]) -> &'a [i32] {
+    let strides = compute_stride(shape);
+    let offset = bidxs
+        .iter()
+        .zip(strides.iter())
+        .map(|(&idx, &stride)| idx * stride)
+        .sum::<usize>();
+
+    let slice_size = shape[bidxs.len()..].iter().product::<usize>();
+    &buf[offset..offset + slice_size]
 }
 
 impl NDArray {
@@ -157,7 +164,6 @@ impl NDArray {
         NDArray {
             buf: buf,
             shape: shape.clone(),
-            stride: compute_stride(&shape),
         }
     }
 
@@ -166,73 +172,117 @@ impl NDArray {
         Self::new(vec![1; size], shape)
     }
 
-    fn matmul(&self, other: NDArray) -> Result<Self, &str> {
-        let a_shape = &self.shape;
-        let b_shape = &other.shape;
+    fn matmul(&self, other: &NDArray) -> Result<Self, String> {
+        let (a_shape, b_shape) = (&self.shape, &other.shape);
         if a_shape.len() < 2 || b_shape.len() < 2 {
-            return Err("Invalid dimensions!");
+            return Err("Invalid dimensions!".to_string());
         }
 
-        println!("a_shape: {:?}", a_shape);
-        println!("b_shape: {:?}", b_shape);
+        let (a_bdims, b_bdims) = (&a_shape[..a_shape.len() - 2], &b_shape[..b_shape.len() - 2]);
+        let (a_nbdims, b_nbdims) = (&a_shape[a_shape.len() - 2..], &b_shape[b_shape.len() - 2..]);
 
-        let a_bdims = &a_shape[..a_shape.len() - 2];
-        let b_bdims = &b_shape[..b_shape.len() - 2];
+        let bc_shape = broadcast(a_bdims, b_bdims)?;
+        let a_bc_shape: Vec<usize> = bc_shape.iter().chain(a_nbdims.iter()).cloned().collect();
+        let b_bc_shape: Vec<usize> = bc_shape.iter().chain(b_nbdims.iter()).cloned().collect();
 
-        let a_nbdims = &a_shape[a_shape.len() - 2..];
-        let b_nbdims = &b_shape[b_shape.len() - 2..];
+        let a_bc = broadcast_to(self.buf.clone(), a_shape.clone(), a_bc_shape.clone())?;
+        let b_bc = broadcast_to(other.buf.clone(), b_shape.clone(), b_bc_shape.clone())?;
 
-        let bc_shape = broadcast(a_bdims, b_bdims).unwrap();
-        let a_bc_shape: Vec<usize> = bc_shape
-            .iter()
-            .cloned()
-            .chain(a_nbdims.iter().cloned())
-            .collect();
-        let b_bc_shape: Vec<usize> = bc_shape
-            .iter()
-            .cloned()
-            .chain(b_nbdims.iter().cloned())
-            .collect();
-        println!("bc_shape: {:?}", bc_shape);
-        println!("a_bc_shape: {:?}", a_bc_shape);
-        println!("b_bc_shape: {:?}", b_bc_shape);
-
-        let a_bc = broadcast_to(self.buf.clone(), a_shape.clone(), a_bc_shape);
-        let b_bc = broadcast_to(other.buf.clone(), b_shape.clone(), b_bc_shape);
-
-        let m = a_shape[a_shape.len() - 2];
-        let n = a_shape[a_shape.len() - 1];
-        let p = b_shape[b_shape.len() - 1];
-        println!("m: {:?}, n: {:?}, p: {:?}", m, n, p);
+        let (m, n, p) = (a_nbdims[0], a_nbdims[1], b_nbdims[1]);
 
         let mut out_shape = bc_shape.clone();
-        out_shape.push(m);
-        out_shape.push(p);
-        println!("out_shape: {:?}", out_shape);
+        out_shape.extend_from_slice(&[m, p]);
 
         let mut out = NDArray::new(vec![0; out_shape.iter().product()], out_shape.clone());
 
         let multi_iter = MultiIndexIterator::new(bc_shape);
-        for idxs in multi_iter.into_iter() {
-            println!("iter-shape: {:?}", idxs);
+        for idxs in multi_iter {
+            let a_mat = bslice(&a_bc, &a_bc_shape, &idxs);
+            let b_mat = bslice(&b_bc, &b_bc_shape, &idxs);
 
-            // TODO: slice along batch dimensions, perform 2D matmul
+            let mut c_mat = vec![0; m * p];
+            for i in 0..m {
+                for j in 0..p {
+                    c_mat[i * p + j] = (0..n).map(|k| a_mat[i * n + k] * b_mat[k * p + j]).sum();
+                }
+            }
+
+            let out_strides = compute_stride(&out.shape);
+            let out_offset = idxs
+                .iter()
+                .zip(out_strides.iter())
+                .map(|(&idx, &stride)| idx * stride)
+                .sum::<usize>();
+            let c_mat_len = m * p;
+            out.buf[out_offset..out_offset + c_mat_len].copy_from_slice(&c_mat);
         }
 
         Ok(out)
     }
+}
 
-    fn reshape(&self, shape: Vec<usize>) -> Self {
-        assert_eq!(self.buf.len(), shape.iter().product());
-        Self::new(self.buf.clone(), shape)
+fn parse_array(s: &str) -> Result<NDArray, String> {
+    let parts: Vec<&str> = s.split(':').collect();
+    if parts.len() != 2 {
+        return Err("Invalid array format".to_string());
     }
+
+    let shape: Vec<usize> = parts[0]
+        .split(',')
+        .map(|s| s.parse().map_err(|_| "Invalid shape".to_string()))
+        .collect::<Result<_, _>>()?;
+
+    let buf: Vec<i32> = parts[1]
+        .split(',')
+        .map(|s| s.parse().map_err(|_| "Invalid buffer".to_string()))
+        .collect::<Result<_, _>>()?;
+
+    if buf.len() != shape.iter().product() {
+        return Err("Buffer size doesn't match shape".to_string());
+    }
+
+    Ok(NDArray::new(buf, shape))
 }
 
 fn main() {
-    let a = NDArray::ones(vec![1, 2, 1, 3]);
-    let b = NDArray::ones(vec![4, 2, 3, 4]);
-    // (3, 2, 1, 4)
-    let c = a.matmul(b).unwrap();
-    println!("c: {:?}", c.shape);
-    println!("c: {:?}", c.buf);
+    let args: Vec<String> = env::args().collect();
+    if args.len() != 3 {
+        eprintln!("Usage: {} <array1> <array2>", args[0]);
+        eprintln!("Format: shape1,shape2,...:val1,val2,...");
+        process::exit(1);
+    }
+
+    let a = parse_array(&args[1]).unwrap_or_else(|e| {
+        eprintln!("Error parsing first array: {}", e);
+        process::exit(1);
+    });
+
+    let b = parse_array(&args[2]).unwrap_or_else(|e| {
+        eprintln!("Error parsing second array: {}", e);
+        process::exit(1);
+    });
+
+    match a.matmul(&b) {
+        Ok(result) => {
+            println!(
+                "{}:{}",
+                result
+                    .shape
+                    .iter()
+                    .map(|&x| x.to_string())
+                    .collect::<Vec<_>>()
+                    .join(","),
+                result
+                    .buf
+                    .iter()
+                    .map(|&x| x.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+        }
+        Err(e) => {
+            eprintln!("Error during matrix multiplication: {}", e);
+            process::exit(1);
+        }
+    }
 }
