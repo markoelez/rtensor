@@ -1,11 +1,12 @@
 use std::cmp::max;
 use std::env;
 use std::iter::repeat;
+use std::ops::Add;
 use std::process;
 
 #[derive(Debug, Clone)]
-struct NDArray {
-    buf: Vec<i32>,
+pub struct NDArray {
+    pub buf: Vec<i32>,
     shape: Vec<usize>,
 }
 
@@ -48,7 +49,6 @@ fn broadcast(a: &[usize], b: &[usize]) -> Result<Vec<usize>, String> {
 struct MultiIndexIterator {
     shape: Vec<usize>,
     curr: Option<Vec<usize>>,
-    done: bool,
 }
 
 impl MultiIndexIterator {
@@ -57,7 +57,6 @@ impl MultiIndexIterator {
         MultiIndexIterator {
             shape: shape,
             curr: Some(start),
-            done: false,
         }
     }
 }
@@ -160,19 +159,25 @@ fn bslice<'a>(buf: &'a [i32], shape: &[usize], bidxs: &[usize]) -> &'a [i32] {
 }
 
 impl NDArray {
-    fn new(buf: Vec<i32>, shape: Vec<usize>) -> Self {
+    pub fn new(buf: Vec<i32>, shape: Vec<usize>) -> Self {
         NDArray {
             buf: buf,
             shape: shape.clone(),
         }
     }
 
-    fn ones(shape: Vec<usize>) -> Self {
+    pub fn ones(shape: Vec<usize>) -> Self {
         let size = shape.iter().product();
         Self::new(vec![1; size], shape)
     }
 
-    fn matmul(&self, other: &NDArray) -> Result<Self, String> {
+    pub fn ones_like(other: &NDArray) -> Self {
+        let shape = other.shape.clone();
+        let size = shape.iter().product();
+        Self::new(vec![1; size], shape)
+    }
+
+    pub fn matmul(&self, other: &NDArray) -> Result<Self, String> {
         let (a_shape, b_shape) = (&self.shape, &other.shape);
         if a_shape.len() < 2 || b_shape.len() < 2 {
             return Err("Invalid dimensions!".to_string());
@@ -218,6 +223,37 @@ impl NDArray {
         }
 
         Ok(out)
+    }
+}
+
+impl Add for &NDArray {
+    type Output = NDArray;
+
+    fn add(self, rhs: Self) -> Self::Output {
+        let out_shape = match broadcast(&self.shape, &rhs.shape) {
+            Ok(shape) => shape,
+            Err(e) => panic!("Cannot add arrays: {}", e),
+        };
+
+        let self_bc =
+            broadcast_to(self.buf.clone(), self.shape.clone(), out_shape.clone()).unwrap();
+        let rhs_bc = broadcast_to(rhs.buf.clone(), rhs.shape.clone(), out_shape.clone()).unwrap();
+
+        let out_buf: Vec<i32> = self_bc
+            .iter()
+            .zip(rhs_bc.iter())
+            .map(|(&a, &b)| a + b)
+            .collect();
+
+        NDArray::new(out_buf, out_shape)
+    }
+}
+
+impl Add for NDArray {
+    type Output = NDArray;
+
+    fn add(self, rhs: Self) -> Self::Output {
+        &self + &rhs
     }
 }
 
